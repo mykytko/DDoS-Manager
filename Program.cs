@@ -2,16 +2,22 @@
 
 using DDoS_Manager;
 
-const int defaultMaxTasksNumber = 10;
+var threads = 10;
 const string targetsFileName = "resources/targets";
 
 var targetSupplier = new TargetSupplier(targetsFileName);
-if (args.Length == 0 || !int.TryParse(args[0], out var maxTasksNumber))
+Console.WriteLine("Starting " + threads + " tasks...");
+
+if (args.Length == 1)
 {
-    maxTasksNumber = defaultMaxTasksNumber;
+    var isParsed = int.TryParse(args[0], out threads);
+    if (!isParsed)
+    {
+        Console.WriteLine("Invalid argument!");
+        return;
+    }
 }
-Console.WriteLine("Starting " + maxTasksNumber + " tasks...");
-var tasks = new AttackTaskManager(maxTasksNumber, targetSupplier);
+var tasks = new AttackTaskManager(threads, targetSupplier);
 
 AppDomain.CurrentDomain.ProcessExit += (_, _) =>
 {
